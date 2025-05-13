@@ -17,7 +17,7 @@ import datetime
 import sys
 from collections import defaultdict
 
-import pkg_resources
+
 
 try:
     import zstandard as zstd
@@ -35,6 +35,16 @@ if sys.version_info[0] == 2:
     reload(sys)
     sys.setdefaultencoding('utf-8')
 
+import importlib.metadata
+
+def check_dependencies(dependencies):
+    for dep in dependencies:
+        package, version_spec = dep.split('>=')  # Only handle simple '>=X.Y' dependencies
+        installed_version = importlib.metadata.version(package)
+        if installed_version < version_spec:
+            raise ModuleNotFoundError()
+
+
 # Note that ubidump depends on the 'header=False' argument to compress/decompress,
 # introduced in python-lzo 1.09
 
@@ -43,7 +53,7 @@ dependencies = [
     'crcmod>=1.7'
 ]
 
-pkg_resources.require(dependencies)
+check_dependencies(dependencies)
 
 
 if sys.version_info[0] == 3:
@@ -52,6 +62,36 @@ if sys.version_info[0] == 3:
 
 # using crcmod to generate the correct crc function.
 crc32 = crcmod.predefined.mkPredefinedCrcFun('CrcJamCrc')
+
+class OffsetReader:
+    def __init__(self, fh, offset, size):
+        self.baseofs = offset
+        self.maxofs = offset+size
+        self.fh = fh
+        self.fh.seek(offset)
+    def read(self, req=None):
+        abspos = self.fh.tell()
+        if req is None:
+            req = self.maxofs-abspos
+        else:
+            req = min(req, self.maxofs-abspos)
+        return self.fh.read(req)
+    def tell(self):
+        return self.fh.tell()-self.baseofs
+    def seek(self, dist, whence=0):
+        abspos = self.fh.tell()
+        match whence:
+            case 0:
+                if dist+self.baseofs > self.maxofs:
+                    return self.fh.seek(self.maxofs)
+                return self.fh.seek(dist+self.baseofs)-self.baseofs
+            case 1:
+                if abspos+dist > self.maxofs:
+                    return self.fh.seek(self.maxofs)
+                return self.fh.seek(dist, 1)-self.baseofs
+            case 2:
+                return self.fh.seek(self.maxofs+dist, 2)-self.baseofs
+
 
 
 class SeekableStdout:
@@ -1057,6 +1097,7 @@ class UbiFs:
                 mst = self.readnode(1, o)
                 o += 0x1000   # Fixed value ... do i need to configure this somewhere?
             except:
+                print("most recent master at %x" % o)
                 return mst
 
     def load(self, masteroffset):
@@ -1066,6 +1107,8 @@ class UbiFs:
             print("using mst from 0x%x, seq: %08x/%08x" % (masteroffset, self.mst.hdr.sqnum, self.mst.cmt_no))
         else:
             self.mst = self.find_most_recent_master()
+        if not self.mst:
+            raise Exception("master node not found")
 
         # todo: check that the 2nd master node matches the first.
         #mst2 = self.readnode(2, 0)
@@ -1397,7 +1440,7 @@ def modestring(mode):
 
 
 def timestring(t):
-    return datetime.datetime.utcfromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def processvolume(vol, volumename, args):
@@ -1625,6 +1668,10 @@ def raw_vhdr_dump(o, data):
         o2 = o + data.find(data2)
         data = data[:64]
 
+    if len(data) != 64:
+        print("short vhdr: %s" % data.hex())
+        return
+
     (
         m,         # 4s
         v,         # B
@@ -1661,6 +1708,8 @@ def raw_node_dump(o, data):
 
     try:
         print("%08x: %s - %s" % (o, repr(ch), repr(node)))
+        if isinstance(node, UbiFsData) and node.data:
+            print("   -> ", b2a_hex(node.data))
     except Exception as e:
         print("%08x: %s" % (o, b2a_hex(data)))
 
@@ -1691,7 +1740,10 @@ def rawhexdump(fh, args):
 
 ##################################################
 def processfile(fn, args):
+    filesize = os.path.getsize(fn)
     with open(fn, "rb") as fh:
+        if args.offset:
+            fh = OffsetReader(fh, args.offset, args.length or filesize)
         if args.rawdump:
             rawhexdump(fh, args)
         else:
@@ -1716,16 +1768,22 @@ def main():
     parser.add_argument('--encoding', '-e',  type=str, help="filename encoding, default=utf-8", default='utf-8')
     parser.add_argument('--masteroffset', '-m',  type=str, help="Which master node to use.")
     parser.add_argument('--root', '-R',  type=str, help="Which Root node to use (hexlnum:hexoffset).")
-    parser.add_argument('--rawdump', action='store_true', help="Raw hexdump of entire volume.") 
+    parser.add_argument('--rawdump', action='store_true', help="Raw hexdump of entire volume, finds all nodes.") 
     parser.add_argument('--volume', type=str, help="which volume to hexdump", metavar="VOLNR")
     parser.add_argument('--hexdump', type=str, help="hexdump part of a volume/leb[/ofs[/size]]", metavar="LEB:OFF:N") 
     parser.add_argument('--saveraw', type=str, help="save the entire volume to the specified file", metavar="FILENAME") 
     parser.add_argument('--nodedump', type=str, help="dump specific node at volume/leb[/ofs]", metavar="LEB:OFF") 
+    parser.add_argument('--offset', type=str, help="decode ubi image at the specifie offset") 
+    parser.add_argument('--length', type=str, help="size of ubi image to decode") 
     parser.add_argument('FILES',  type=str, nargs='+', help="list of ubi images to use")
     args = parser.parse_args()
 
     if args.masteroffset:
         args.masteroffset = [int(_,0) for _ in args.masteroffset.split(':')]
+    if args.length:
+        args.length = int(args.length, 0)
+    if args.offset:
+        args.offset = int(args.offset, 0)
     if args.volume:
         args.volume = int(args.volume, 0)
     if args.hexdump:
